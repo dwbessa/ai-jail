@@ -358,6 +358,35 @@ fn push_file_read_section(
     for link in ["/tmp", "/etc", "/var"] {
         profile.push_str(&format!("(allow file-read* (literal \"{link}\"))\n"));
     }
+    // Same root-node problem, one or more levels down: every subpath
+    // grant below is scoped to a specific $HOME/... entry (project
+    // dir, .claude, dotdirs, ...), so $HOME itself and its ancestors
+    // (e.g. /Users, and /Users/<name> itself) never get a rule. Node
+    // resolves its entry-point module's real path at startup by
+    // lstat-ing every ancestor directory (fs.realpathSync, used by
+    // Module._findPath); with any of those uncovered, that lstat is
+    // denied and `node anything.js` aborts before running any user
+    // code:
+    //   Error: EPERM: operation not permitted, lstat '/Users'
+    //       at Object.realpathSync (node:fs:...)
+    // Each literal grants only that one directory entry (so e.g.
+    // `ls /Users` lists usernames, matching the exposure the root "/"
+    // rule above already accepts) -- never a subtree, so other users'
+    // home directories, and the contents of $HOME itself beyond what's
+    // separately allow-listed, stay fully denied.
+    let mut ancestor = super::home_dir();
+    loop {
+        profile.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            sbpl_escape(ancestor.to_string_lossy().as_ref())
+        ));
+        match ancestor.parent() {
+            Some(parent) if parent != Path::new("/") => {
+                ancestor = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
     for rd_path in macos_read_paths(config, project_dir) {
         push_path_rule(profile, "allow", "file-read*", &rd_path);
     }
@@ -1437,6 +1466,88 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    #[test]
+    fn read_section_grants_home_dir_ancestor_chain() {
+        // Node's fs.realpathSync (used to resolve its own entry-point
+        // module at startup) lstats every ancestor directory of a
+        // script's path. The subpath rules elsewhere only cover
+        // specific $HOME/... entries, never $HOME's ancestors
+        // themselves (e.g. /Users, /Users/<name>) -- without a literal
+        // rule on each, `node anything.js` aborts with EPERM before
+        // running any user code, on any path under $HOME.
+        let profile = generate_sbpl_profile(
+            &Config::default(),
+            &PathBuf::from("/tmp/test-project"),
+        );
+        let home = super::super::home_dir();
+        let mut ancestor = home.as_path();
+        loop {
+            assert!(
+                profile.contains(&format!(
+                    "(allow file-read* (literal \"{}\"))",
+                    ancestor.to_string_lossy()
+                )),
+                "missing literal read rule for ancestor {ancestor:?}"
+            );
+            match ancestor.parent() {
+                Some(parent) if parent != Path::new("/") => ancestor = parent,
+                _ => break,
+            }
+        }
+    }
+
+    #[test]
+    fn node_resolves_script_under_generated_profile() {
+        // Real end-to-end reproduction of the EPERM above: run a
+        // trivial script through actual Node module resolution (not
+        // just `node -e`, which skips entry-point realpath resolution)
+        // under sandbox-exec with the generated profile.
+        let node_candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
+        let Some(node) = node_candidates
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+        else {
+            return;
+        };
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+
+        // Under $HOME, not std::env::temp_dir() (typically under the
+        // separately-symlinked /var/folders on macOS): this test
+        // targets the $HOME-ancestor-chain fix specifically, matching
+        // where a real project normally lives.
+        let project = super::super::home_dir()
+            .join(format!("ai-jail-seatbelt-node-test-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        let script = project.join("script.js");
+        std::fs::write(&script, b"console.log('ok');\n").unwrap();
+
+        let config = Config::default();
+        let profile = generate_sbpl_profile(&config, &project);
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg(&node)
+            .arg(&script)
+            .output()
+            .expect("failed to run sandbox-exec");
+
+        let _ = std::fs::remove_dir_all(&project);
+
+        assert!(
+            output.status.success(),
+            "node failed to resolve/run a script under the generated \
+             profile: status={:?} stderr={} profile:\n{profile}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 
     #[test]
