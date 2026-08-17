@@ -749,6 +749,12 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         "/private/etc",
         "/Library",
         "/dev",
+        // macOS's default-shell selector (chsh-alternatives style
+        // symlinks, e.g. /private/var/select/sh -> /bin/bash). Tools
+        // that resolve the user's login shell read this directly;
+        // without it Claude Code's SessionStart hook fails to open
+        // it (non-fatal, but noisy on every launch).
+        "/private/var/select",
     ] {
         let pb = PathBuf::from(p);
         if super::path_exists(&pb) {
@@ -1476,6 +1482,43 @@ mod tests {
         let project = PathBuf::from("/tmp/test-project");
         let paths = macos_read_paths(&Config::default(), &project);
         assert!(paths.contains(&project));
+    }
+
+    #[test]
+    fn read_paths_include_var_select() {
+        // /private/var/select/sh resolves the user's default shell
+        // (macOS's chsh-alternatives mechanism); Claude Code's
+        // SessionStart hook reads it directly on every launch.
+        let project = PathBuf::from("/tmp/test-project");
+        let paths = macos_read_paths(&Config::default(), &project);
+        assert!(paths.contains(&PathBuf::from("/private/var/select")));
+    }
+
+    #[test]
+    fn open_var_select_sh_succeeds_under_generated_profile() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let config = Config::default();
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/cat")
+            .arg("/private/var/select/sh")
+            .output()
+            .expect("failed to run sandbox-exec");
+
+        assert!(
+            output.status.success(),
+            "reading /private/var/select/sh was denied: \
+             status={:?} stderr={} profile:\n{profile}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]
