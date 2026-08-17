@@ -1349,6 +1349,53 @@ mod tests {
     }
 
     #[test]
+    fn generated_profile_execs_without_dyld_abort() {
+        // String-matching the profile (as in
+        // `restricted_reads_allow_root_node` above) only proves the root
+        // read literal is present in the text; it does not prove
+        // sandbox-exec actually accepts the compiled profile at exec
+        // time. On macOS 26 betas, dyld SIGABRTs (exit 134) any
+        // dynamically linked child when the root-node read rule is
+        // missing or wrong, regardless of how the write section is
+        // shaped. Run the real profile through sandbox-exec so a
+        // future regression is caught even if it doesn't change the
+        // profile text in a way the string assertion would notice
+        // (e.g. a helper that only fires under certain configs).
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        use std::os::unix::process::ExitStatusExt;
+        let config = Config {
+            rw_maps: vec![PathBuf::from("/tmp")],
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/echo")
+            .arg("hi")
+            .output()
+            .expect("failed to run sandbox-exec");
+
+        assert!(
+            !matches!(output.status.signal(), Some(6)),
+            "child aborted (SIGABRT) under generated profile; \
+             likely the dyld root-read-node regression, profile:\n{profile}"
+        );
+        assert!(
+            output.status.success(),
+            "sandbox-exec rejected the generated profile: \
+             status={:?} stderr={} profile:\n{profile}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
     fn read_paths_include_project() {
         let project = PathBuf::from("/tmp/test-project");
         let paths = macos_read_paths(&Config::default(), &project);
