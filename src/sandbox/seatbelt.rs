@@ -755,6 +755,15 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         // without it Claude Code's SessionStart hook fails to open
         // it (non-fatal, but noisy on every launch).
         "/private/var/select",
+        // Homebrew's Apple Silicon prefix. Without this, every
+        // Homebrew-installed tool (node, python3, git, rg, ...) is
+        // unreadable inside the sandbox, breaking hooks and any
+        // command that shells out to one -- "command not found" even
+        // though it's on $PATH and installed on the host. Homebrew's
+        // Intel prefix (/usr/local) needs no separate entry: it's
+        // already a subpath of /usr above. Same trust tier as
+        // /usr/bin -- installed program binaries, not user data.
+        "/opt/homebrew",
     ] {
         let pb = PathBuf::from(p);
         if super::path_exists(&pb) {
@@ -1431,6 +1440,38 @@ mod tests {
     }
 
     #[test]
+    fn homebrew_binary_execs_under_generated_profile() {
+        // Real end-to-end check: a Homebrew-installed binary (node, if
+        // present) must actually run under sandbox-exec with the
+        // generated profile, not just have its prefix listed as a
+        // string in the profile.
+        let node = PathBuf::from("/opt/homebrew/bin/node");
+        if !Path::new("/usr/bin/sandbox-exec").is_file() || !node.is_file() {
+            return;
+        }
+        let config = Config::default();
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg(&node)
+            .arg("--version")
+            .output()
+            .expect("failed to run sandbox-exec");
+
+        assert!(
+            output.status.success(),
+            "node --version failed under the generated profile: \
+             status={:?} stderr={} profile:\n{profile}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
     fn generated_profile_execs_without_dyld_abort() {
         // String-matching the profile (as in
         // `restricted_reads_allow_root_node` above) only proves the root
@@ -1492,6 +1533,22 @@ mod tests {
         let project = PathBuf::from("/tmp/test-project");
         let paths = macos_read_paths(&Config::default(), &project);
         assert!(paths.contains(&PathBuf::from("/private/var/select")));
+    }
+
+    #[test]
+    fn read_paths_include_homebrew_apple_silicon_prefix() {
+        // Without this, every Homebrew-installed tool (node, python3,
+        // git, rg, ...) is unreadable inside the sandbox -- "command
+        // not found" even though it's on $PATH and installed on the
+        // host. Guarded on the prefix actually existing: this test
+        // machine might be Intel-only (Homebrew at /usr/local, already
+        // covered as a subpath of /usr) or have no Homebrew at all.
+        if !Path::new("/opt/homebrew").is_dir() {
+            return;
+        }
+        let project = PathBuf::from("/tmp/test-project");
+        let paths = macos_read_paths(&Config::default(), &project);
+        assert!(paths.contains(&PathBuf::from("/opt/homebrew")));
     }
 
     #[test]
