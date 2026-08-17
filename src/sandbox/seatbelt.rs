@@ -346,6 +346,18 @@ fn push_file_read_section(
     // dyld needs the root node to resolve absolute paths. This literal rule
     // does not grant any filesystem subtree.
     profile.push_str("(allow file-read* (literal \"/\"))\n");
+    // Darwin's top-level /tmp, /etc, and /var are symlinks into /private/*.
+    // `push_path_rule` canonicalizes every path it emits, so listing these
+    // names anywhere else in the allow-list collapses straight to their
+    // /private/* target and never grants a rule on the symlink node itself.
+    // Resolving a symlink requires reading *its own* metadata first (a
+    // separate kernel check from reading the target), so without an
+    // explicit literal rule here, any child that writes or stats a
+    // hardcoded /tmp/... path (common — many tools ignore $TMPDIR) gets
+    // EPERM even when the resolved /private/tmp subtree is fully allowed.
+    for link in ["/tmp", "/etc", "/var"] {
+        profile.push_str(&format!("(allow file-read* (literal \"{link}\"))\n"));
+    }
     for rd_path in macos_read_paths(config, project_dir) {
         push_path_rule(profile, "allow", "file-read*", &rd_path);
     }
@@ -734,7 +746,6 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         "/usr",
         "/bin",
         "/sbin",
-        "/etc",
         "/private/etc",
         "/Library",
         "/dev",
@@ -1346,6 +1357,71 @@ mod tests {
                 "must not grant subpath / (would expose everything, {mode})"
             );
         }
+    }
+
+    #[test]
+    fn read_section_grants_darwin_symlink_nodes() {
+        // /tmp, /etc, /var are symlinks into /private/*. push_path_rule
+        // canonicalizes every path it emits, so nothing else in the
+        // profile ever grants a rule on the symlink node itself -- only
+        // on its resolved /private/* target. Without a literal rule on
+        // the symlink, the kernel can't resolve it (file-read-metadata
+        // denied) and any child that touches a hardcoded /tmp/... path
+        // gets EPERM even though /private/tmp is fully allowed.
+        let config = Config::default();
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+        for link in ["/tmp", "/etc", "/var"] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow file-read* (literal \"{link}\"))"
+                )),
+                "must grant a literal read rule on the {link} symlink node itself"
+            );
+        }
+    }
+
+    #[test]
+    fn mkdir_through_tmp_symlink_succeeds_under_generated_profile() {
+        // Regression for the bug above, exercised for real: sandbox-exec
+        // must let a child mkdir a fresh directory reached through the
+        // /tmp symlink, not just through its resolved /private/tmp
+        // target. This is exactly what tools that hardcode /tmp/<name>
+        // (rather than honoring $TMPDIR) do on exec.
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let config = Config {
+            rw_maps: vec![PathBuf::from("/tmp")],
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+
+        let target = format!(
+            "/tmp/ai-jail-seatbelt-symlink-test-{}",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir(format!("/private{target}",));
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/mkdir")
+            .arg(&target)
+            .output()
+            .expect("failed to run sandbox-exec");
+
+        let _ = std::fs::remove_dir(format!("/private{target}"));
+
+        assert!(
+            output.status.success(),
+            "mkdir through the /tmp symlink was denied: \
+             status={:?} stderr={} profile:\n{profile}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]
